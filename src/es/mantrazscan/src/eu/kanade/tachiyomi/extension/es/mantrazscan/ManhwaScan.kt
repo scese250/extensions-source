@@ -2,7 +2,6 @@ package eu.kanade.tachiyomi.extension.es.mantrazscan
 
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.FilterList
-import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
@@ -99,10 +98,8 @@ class ManhwaScan : ParsedHttpSource() {
     }
 
     // =============================== Pages ===============================
-    override fun pageListParse(document: Document): List<Page> {
-        return document.select("img[src*=wp-content/uploads/WP-manga]").mapIndexed { index, element ->
-            Page(index, imageUrl = element.attr("abs:src"))
-        }
+    override fun pageListParse(document: Document): List<Page> = document.select("img[src*=wp-content/uploads/WP-manga]").mapIndexed { index, element ->
+        Page(index, imageUrl = element.attr("abs:src"))
     }
 
     override fun imageUrlParse(document: Document): String = throw UnsupportedOperationException()
