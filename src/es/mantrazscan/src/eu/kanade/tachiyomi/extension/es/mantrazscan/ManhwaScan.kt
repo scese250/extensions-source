@@ -77,6 +77,11 @@ class ManhwaScan : HttpSource() {
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
     // ============================== Details ==============================
+    override fun getMangaUrl(manga: SManga): String = "$baseUrl${migrateUrl(manga.url, isManga = true)}"
+
+    override fun mangaDetailsRequest(manga: SManga): Request =
+        GET("$baseUrl${migrateUrl(manga.url, isManga = true)}", headers)
+
     override fun mangaDetailsParse(response: Response) = SManga.create().apply {
         val document = response.asJsoup()
         title = document.selectFirst("h1.series-title")?.text() ?: ""
@@ -87,6 +92,11 @@ class ManhwaScan : HttpSource() {
     }
 
     // ============================= Chapters ==============================
+    override fun getChapterUrl(chapter: SChapter): String = "$baseUrl${migrateUrl(chapter.url, isManga = false)}"
+
+    override fun chapterListRequest(manga: SManga): Request =
+        GET("$baseUrl${migrateUrl(manga.url, isManga = true)}", headers)
+
     override fun chapterListParse(response: Response): List<SChapter> {
         val document = response.asJsoup()
         return document.select("a.ch-row").map { element ->
@@ -98,6 +108,9 @@ class ManhwaScan : HttpSource() {
     }
 
     // =============================== Pages ===============================
+    override fun pageListRequest(chapter: SChapter): Request =
+        GET("$baseUrl${migrateUrl(chapter.url, isManga = false)}", headers)
+
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
         return document.select("img[src*=wp-content/uploads/WP-manga]").mapIndexed { index, element ->
@@ -106,4 +119,12 @@ class ManhwaScan : HttpSource() {
     }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
+
+    // ============================= Utilities =============================
+    private fun migrateUrl(url: String, isManga: Boolean): String {
+        if (!url.contains("#")) return url
+        val slug = url.substringAfter("#")
+        return if (isManga) "/manga/$slug/" else "/manga/$slug"
+    }
 }
+
