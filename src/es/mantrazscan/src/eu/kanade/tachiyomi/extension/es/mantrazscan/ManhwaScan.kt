@@ -79,8 +79,7 @@ class ManhwaScan : HttpSource() {
     // ============================== Details ==============================
     override fun getMangaUrl(manga: SManga): String = "$baseUrl${migrateUrl(manga.url, isManga = true)}"
 
-    override fun mangaDetailsRequest(manga: SManga): Request =
-        GET("$baseUrl${migrateUrl(manga.url, isManga = true)}", headers)
+    override fun mangaDetailsRequest(manga: SManga): Request = GET("$baseUrl${migrateUrl(manga.url, isManga = true)}", headers)
 
     override fun mangaDetailsParse(response: Response) = SManga.create().apply {
         val document = response.asJsoup()
@@ -94,8 +93,7 @@ class ManhwaScan : HttpSource() {
     // ============================= Chapters ==============================
     override fun getChapterUrl(chapter: SChapter): String = "$baseUrl${migrateUrl(chapter.url, isManga = false)}"
 
-    override fun chapterListRequest(manga: SManga): Request =
-        GET("$baseUrl${migrateUrl(manga.url, isManga = true)}", headers)
+    override fun chapterListRequest(manga: SManga): Request = GET("$baseUrl${migrateUrl(manga.url, isManga = true)}", headers)
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val document = response.asJsoup()
@@ -108,8 +106,7 @@ class ManhwaScan : HttpSource() {
     }
 
     // =============================== Pages ===============================
-    override fun pageListRequest(chapter: SChapter): Request =
-        GET("$baseUrl${migrateUrl(chapter.url, isManga = false)}", headers)
+    override fun pageListRequest(chapter: SChapter): Request = GET("$baseUrl${migrateUrl(chapter.url, isManga = false)}", headers)
 
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
@@ -127,4 +124,3 @@ class ManhwaScan : HttpSource() {
         return if (isManga) "/manga/$slug/" else "/manga/$slug"
     }
 }
-
