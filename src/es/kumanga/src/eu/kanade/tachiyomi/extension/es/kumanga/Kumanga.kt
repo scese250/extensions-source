@@ -1,13 +1,7 @@
 package eu.kanade.tachiyomi.extension.es.kumanga
 
-import android.app.Application
-import android.content.SharedPreferences
 import android.util.Base64
 import androidx.preference.PreferenceScreen
-import eu.kanade.tachiyomi.lib.randomua.addRandomUAPreferenceToScreen
-import eu.kanade.tachiyomi.lib.randomua.getPrefCustomUA
-import eu.kanade.tachiyomi.lib.randomua.getPrefUAType
-import eu.kanade.tachiyomi.lib.randomua.setRandomUserAgent
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
@@ -20,6 +14,8 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.lib.randomua.addRandomUAPreference
+import keiyoushi.lib.randomua.setRandomUserAgent
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.contentOrNull
@@ -30,12 +26,12 @@ import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-import uy.kohesive.injekt.Injekt
-import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
 import java.util.concurrent.TimeUnit
 
-class Kumanga : HttpSource(), ConfigurableSource {
+class Kumanga :
+    HttpSource(),
+    ConfigurableSource {
 
     override val name = "KuManga"
 
@@ -49,18 +45,12 @@ class Kumanga : HttpSource(), ConfigurableSource {
 
     private val json: Json by injectLazy()
 
-    private val preferences: SharedPreferences =
-        Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
-
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
         .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+        .setRandomUserAgent()
 
     override val client: OkHttpClient = super.client.newBuilder()
-        .setRandomUserAgent(
-            preferences.getPrefUAType(),
-            preferences.getPrefCustomUA(),
-        )
         .rateLimit(2)
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
@@ -339,33 +329,31 @@ class Kumanga : HttpSource(), ConfigurableSource {
         throw Exception("No fue posible obtener las páginas del capítulo")
     }
 
-    private fun decryptJaja(jajaVal: String): List<String> {
-        return try {
-            val key = "Jr54VwepF4La"
-            val rawBytes = Base64.decode(jajaVal, Base64.DEFAULT)
-            val decryptedChars = CharArray(rawBytes.size) { i ->
-                val byteVal = rawBytes[i].toInt() and 0xFF
-                val keyChar = key[i % key.length].code
-                (byteVal xor keyChar).toChar()
-            }
-            val jsonString = String(decryptedChars)
-            val items = json.decodeFromString<List<String>>(jsonString)
-            items.map { item ->
-                if ("src=" in item) {
-                    val hexStr = item.substringAfter("src=").substringBefore("&")
-                    try {
-                        val bytes = hexStr.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
-                        String(bytes, Charsets.UTF_8)
-                    } catch (_: Exception) {
-                        if (item.startsWith("/")) "$baseUrl$item" else item
-                    }
-                } else {
+    private fun decryptJaja(jajaVal: String): List<String> = try {
+        val key = "Jr54VwepF4La"
+        val rawBytes = Base64.decode(jajaVal, Base64.DEFAULT)
+        val decryptedChars = CharArray(rawBytes.size) { i ->
+            val byteVal = rawBytes[i].toInt() and 0xFF
+            val keyChar = key[i % key.length].code
+            (byteVal xor keyChar).toChar()
+        }
+        val jsonString = String(decryptedChars)
+        val items = json.decodeFromString<List<String>>(jsonString)
+        items.map { item ->
+            if ("src=" in item) {
+                val hexStr = item.substringAfter("src=").substringBefore("&")
+                try {
+                    val bytes = hexStr.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+                    String(bytes, Charsets.UTF_8)
+                } catch (_: Exception) {
                     if (item.startsWith("/")) "$baseUrl$item" else item
                 }
+            } else {
+                if (item.startsWith("/")) "$baseUrl$item" else item
             }
-        } catch (_: Exception) {
-            emptyList()
         }
+    } catch (_: Exception) {
+        emptyList()
     }
 
     override fun imageRequest(page: Page): Request {
@@ -388,7 +376,7 @@ class Kumanga : HttpSource(), ConfigurableSource {
     )
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        addRandomUAPreferenceToScreen(screen)
+        screen.addRandomUAPreference()
     }
 
     private class Type(name: String, val id: String) : Filter.CheckBox(name)
