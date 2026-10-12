@@ -1,4 +1,4 @@
-name: CI
+name: Build KuManga APK
 
 on:
   push:
@@ -7,80 +7,55 @@ on:
     paths:
       - '**'
       - '!**.md'
-      - '!.github/**'
-      - '.github/scripts/**'
-      - '.github/workflows/build_push.yml'
   workflow_dispatch:
 
-permissions: {}
-
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CI_CHUNK_SIZE: 80
-  IS_PR_CHECK: true
-
 jobs:
-  prepare:
-    name: Prepare job
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      matrix: ${{ steps.generate-matrices.outputs.matrix }}
-      delete: ${{ steps.generate-matrices.outputs.delete }}
-    steps:
-      - name: Checkout main branch
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Get last successful CI commit
-        uses: nrwl/nx-set-shas@afb73a62d26e41464e9254689e1fd6122ee683c1 # v5.0.1
-        with:
-          fallback-sha: d2928df0f
-
-      - id: generate-matrices
-        name: Create output matrices
-        run: |
-          python ./.github/scripts/generate-build-matrices.py "$NX_BASE" Release
-
   build:
-    name: Build extensions (${{ matrix.chunk.number }})
-    needs: prepare
+    name: Build KuManga APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    if: ${{ toJson(fromJson(needs.prepare.outputs.matrix).chunk) != '[]' }}
-    strategy:
-      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    timeout-minutes: 20
+
     steps:
-      - name: Checkout main branch
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          persist-credentials: false
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Java
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        uses: actions/setup-java@v4
         with:
           java-version: 17
           distribution: temurin
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
-        with:
-          cache-read-only: ${{ matrix.chunk.number > 1 }}
+        uses: gradle/actions/setup-gradle@v4
 
-      - name: Build extensions (${{ matrix.chunk.number }})
-        env:
-          MODULES: ${{ join(matrix.chunk.modules, ' ') }}
+      - name: Prepare signing key
+        if: ${{ secrets.SIGNING_KEY != '' }}
         run: |
-          ./gradlew $MODULES
+          echo "${{ secrets.SIGNING_KEY }}" | base64 -d > signingkey.jks
 
-      - name: Upload APKs (${{ matrix.chunk.number }})
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - name: Build KuManga Extension
+        env:
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :src:es:kumanga:assembleRelease
+
+      - name: Upload KuManga APK
+        uses: actions/upload-artifact@v4
         with:
-          name: "individual-apks-${{ matrix.chunk.number }}"
-          path: "**/*.apk"
-          retention-days: 1
+          name: kumanga-apk
+          path: |
+            src/es/kumanga/build/outputs/apk/release/*.apk
+            src/es/kumanga/build/outputs/apk/debug/*.apk
+          retention-days: 30
+
+      - name: Clean up CI files
+        if: always()
+        run: |
+          [ -f signingkey.jks ] && rm -f signingkey.jks || true
