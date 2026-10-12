@@ -133,6 +133,8 @@ class Kumanga :
 
     // =========================== Manga Details ============================
 
+    override fun getMangaUrl(manga: SManga) = "$baseUrl${manga.url}"
+
     override fun mangaDetailsParse(response: Response): SManga = SManga.create().apply {
         val document = response.asJsoup()
         thumbnail_url = document.selectFirst("meta[property=og:image]")?.attr("content")
