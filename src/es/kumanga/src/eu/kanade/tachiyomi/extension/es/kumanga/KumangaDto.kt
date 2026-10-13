@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.extension.es.kumanga
 
 import eu.kanade.tachiyomi.source.model.SManga
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlin.math.ceil
 
@@ -27,5 +28,5 @@ class ComicDto(
 
 @Serializable
 class ImageDto(
-    val imgURL: String = "",
+    @SerialName("imgURL") val imgURL: String = "",
 )

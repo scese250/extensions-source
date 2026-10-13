@@ -1,10 +1,8 @@
 package eu.kanade.tachiyomi.extension.es.kumanga
 
 import android.util.Base64
-import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
-import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -13,8 +11,6 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
-import keiyoushi.lib.randomua.addRandomUAPreference
-import keiyoushi.lib.randomua.setRandomUserAgent
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.contentOrNull
@@ -25,12 +21,11 @@ import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import org.jsoup.Jsoup
 import uy.kohesive.injekt.injectLazy
 import java.util.concurrent.TimeUnit
 
-class Kumanga :
-    HttpSource(),
-    ConfigurableSource {
+class Kumanga : HttpSource() {
 
     override val name = "KuManga"
 
@@ -40,18 +35,40 @@ class Kumanga :
 
     override val lang = "es"
 
-    override val supportsLatest = false
+    override val supportsLatest = true
 
     private val json: Json by injectLazy()
+
+    private var rCookie: String? = null
 
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
         .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
-        .setRandomUserAgent()
 
     override val client: OkHttpClient = super.client.newBuilder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
+        .addNetworkInterceptor { chain ->
+            val req = chain.request()
+            val builder = req.newBuilder()
+            if (rCookie != null) {
+                val existing = req.header("Cookie")
+                if (existing != null) {
+                    if (!existing.contains(rCookie!!)) {
+                        builder.header("Cookie", "$existing; $rCookie")
+                    }
+                } else {
+                    builder.header("Cookie", rCookie!!)
+                }
+            }
+            val res = chain.proceed(builder.build())
+            val setCookies = res.headers("Set-Cookie")
+            val rCookieHeader = setCookies.find { it.startsWith("__r=") }
+            if (rCookieHeader != null) {
+                rCookie = rCookieHeader.substringBefore(";")
+            }
+            res
+        }
         .build()
 
     // ============================== Popular ===============================
@@ -81,9 +98,37 @@ class Kumanga :
 
     // ============================== Latest ================================
 
-    override fun latestUpdatesRequest(page: Int) = throw UnsupportedOperationException()
+    override fun latestUpdatesRequest(page: Int): Request = GET(baseUrl, headers)
 
-    override fun latestUpdatesParse(response: Response) = throw UnsupportedOperationException()
+    override fun latestUpdatesParse(response: Response): MangasPage {
+        val document = response.asJsoup()
+        val mangas = document.select("div.h_move").mapNotNull { element ->
+            val linkManga = element.selectFirst("a.mhu-name") ?: return@mapNotNull null
+            val linkChapter = element.selectFirst("a.mhu-card")
+
+            SManga.create().apply {
+                val rawHref = linkManga.attr("href")
+                url = if (rawHref.startsWith("http")) {
+                    rawHref.removePrefix(baseUrl)
+                } else if (rawHref.startsWith("/")) {
+                    rawHref
+                } else {
+                    "/$rawHref"
+                }
+                title = linkManga.text().trim()
+
+                if (linkChapter != null) {
+                    val bgImage = linkChapter.attr("style")
+                    val bgUrl = bgImage.substringAfter("url(").substringBefore(")").trim('"', '\'')
+                    if (bgUrl.isNotEmpty()) {
+                        thumbnail_url = if (bgUrl.startsWith("http")) bgUrl else "$baseUrl/$bgUrl"
+                    }
+                }
+            }
+        }.distinctBy { it.url }
+
+        return MangasPage(mangas, false)
+    }
 
     // ============================== Search ================================
 
@@ -131,8 +176,6 @@ class Kumanga :
 
     // =========================== Manga Details ============================
 
-    override fun getMangaUrl(manga: SManga) = "$baseUrl${manga.url}"
-
     override fun mangaDetailsParse(response: Response): SManga = SManga.create().apply {
         val document = response.asJsoup()
         thumbnail_url = document.selectFirst("meta[property=og:image]")?.attr("content")
@@ -158,6 +201,9 @@ class Kumanga :
         val chapters = mutableListOf<SChapter>()
         val seenUrls = mutableSetOf<String>()
 
+        val currentPath = response.request.url.encodedPath
+        val mangaId = currentPath.substringAfter("/manga/").substringBefore("/")
+
         // 1. Priority: application/ld+json contains full structured list of chapters
         for (script in document.select("script[type=application/ld+json]")) {
             val jsonStr = script.data()
@@ -167,23 +213,30 @@ class Kumanga :
                 val examples = jsonElement.jsonObject["workExample"]?.jsonArray
                 if (examples != null) {
                     for (ex in examples) {
-                        val url = ex.jsonObject["url"]?.jsonPrimitive?.contentOrNull.orEmpty()
-                        if (url.isNotBlank() && seenUrls.add(url)) {
-                            val numMatch = Regex("""/capitulo/([0-9]+(?:\.[0-9]+)?)""").find(url)
+                        val rawUrl = ex.jsonObject["url"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                        if (rawUrl.isNotBlank()) {
+                            val numMatch = Regex("""/capitulo/([0-9]+(?:\.[0-9]+)?)""").find(rawUrl)
                             val numStr = numMatch?.groupValues?.get(1).orEmpty()
-                            val nameStr = ex.jsonObject["name"]?.jsonPrimitive?.contentOrNull.orEmpty()
-                            val chapterName = if (numStr.isNotEmpty()) {
-                                if (nameStr.isNotEmpty() && nameStr != "Capítulo $numStr") "Capítulo $numStr - $nameStr" else "Capítulo $numStr"
+                            val cleanPath = if (mangaId.isNotEmpty() && numStr.isNotEmpty()) {
+                                "/manga/$mangaId/capitulo/$numStr"
                             } else {
-                                if (nameStr.isNotEmpty()) nameStr else "Capítulo"
+                                rawUrl.removePrefix(baseUrl).let { if (it.startsWith("/")) it else "/$it" }
                             }
-                            chapters.add(
-                                SChapter.create().apply {
-                                    this.name = chapterName
-                                    setUrlWithoutDomain(url)
-                                    chapter_number = numStr.toFloatOrNull() ?: -1f
-                                },
-                            )
+                            if (seenUrls.add(cleanPath)) {
+                                val nameStr = ex.jsonObject["name"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                                val chapterName = if (numStr.isNotEmpty()) {
+                                    if (nameStr.isNotEmpty() && nameStr != "Capítulo $numStr") "Capítulo $numStr - $nameStr" else "Capítulo $numStr"
+                                } else {
+                                    if (nameStr.isNotEmpty()) nameStr else "Capítulo"
+                                }
+                                chapters.add(
+                                    SChapter.create().apply {
+                                        this.name = chapterName
+                                        this.url = cleanPath
+                                        this.chapter_number = numStr.toFloatOrNull() ?: -1f
+                                    },
+                                )
+                            }
                         }
                     }
                 }
@@ -191,169 +244,249 @@ class Kumanga :
         }
 
         // 2. Fallback: DOM links with /capitulo/
-        if (chapters.isEmpty()) {
-            for (a in document.select("a[href*=/capitulo/]")) {
-                val url = a.attr("abs:href")
-                if (url.isNotBlank() && seenUrls.add(url)) {
-                    val numMatch = Regex("""/capitulo/([0-9]+(?:\.[0-9]+)?)""").find(url)
-                    val numStr = numMatch?.groupValues?.get(1).orEmpty()
-                    val text = a.text().trim()
-                    chapters.add(
-                        SChapter.create().apply {
-                            this.name = if (text.isNotEmpty()) text else "Capítulo $numStr"
-                            setUrlWithoutDomain(url)
-                            chapter_number = numStr.toFloatOrNull() ?: -1f
-                        },
-                    )
-                }
+        for (a in document.select("a[href*=/capitulo/]")) {
+            val rawHref = a.attr("href")
+            val numMatch = Regex("""/capitulo/([0-9]+(?:\.[0-9]+)?)""").find(rawHref)
+            val numStr = numMatch?.groupValues?.get(1).orEmpty()
+            val cleanPath = if (mangaId.isNotEmpty() && numStr.isNotEmpty()) {
+                "/manga/$mangaId/capitulo/$numStr"
+            } else {
+                rawHref.removePrefix(baseUrl).let { if (it.startsWith("/")) it else "/$it" }
+            }
+            if (seenUrls.add(cleanPath)) {
+                val text = a.text().trim()
+                chapters.add(
+                    SChapter.create().apply {
+                        this.name = if (text.isNotEmpty()) text else "Capítulo $numStr"
+                        this.url = cleanPath
+                        this.chapter_number = numStr.toFloatOrNull() ?: -1f
+                    },
+                )
             }
         }
 
         // 3. Fallback: OTHER_CHAPTERS in script
-        if (chapters.isEmpty()) {
-            val midMatch = Regex("""/manga/(\d+)""").find(document.location())
-            val mid = midMatch?.groupValues?.get(1).orEmpty()
-            val scriptText = document.select("script:containsData(OTHER_CHAPTERS)").toString()
-            val otherMatch = Regex("""let\s+OTHER_CHAPTERS\s*=\s*(\[.*?\]);""").find(scriptText)
-            if (otherMatch != null && mid.isNotEmpty()) {
-                try {
-                    val array = json.parseToJsonElement(otherMatch.groupValues[1]).jsonArray
-                    for (entry in array) {
-                        val numStr = entry.jsonObject["NumCap"]?.jsonPrimitive?.contentOrNull.orEmpty()
-                        val titleStr = entry.jsonObject["title"]?.jsonPrimitive?.contentOrNull.orEmpty()
-                        val url = "$baseUrl/manga/$mid/capitulo/$numStr"
-                        if (seenUrls.add(url)) {
-                            chapters.add(
-                                SChapter.create().apply {
-                                    this.name = "Capítulo $numStr" + if (titleStr.isNotEmpty()) " - $titleStr" else ""
-                                    setUrlWithoutDomain(url)
-                                    chapter_number = numStr.toFloatOrNull() ?: -1f
-                                },
-                            )
-                        }
-                    }
-                } catch (_: Exception) {}
-            }
-        }
-
-        return chapters
-    }
-
-    // =============================== Pages ================================
-
-    override fun pageListParse(response: Response): List<Page> {
-        val requestUrl = response.request.url.toString()
-        val doc = response.asJsoup()
-
-        // Extract chapter ID (cid)
-        var cid = Regex("""/(?:leer|c)/(\d+)""").find(requestUrl)?.groupValues?.get(1).orEmpty()
-        if (cid.isEmpty()) {
-            val link = doc.selectFirst("a[href*=/leer/], a[href*=/c/]")?.attr("href").orEmpty()
-            cid = Regex("""/(?:leer|c)/(\d+)""").find(link)?.groupValues?.get(1).orEmpty()
-        }
-        if (cid.isEmpty()) {
-            cid = Regex("""(?:manga/(?:leer|c)/)(\d+)""").find(doc.html())?.groupValues?.get(1).orEmpty()
-        }
-
-        // 1. Try jaja decryption if available
-        var jajaStr: String? = null
-        val scriptJaja = doc.selectFirst("script:containsData(jaja)")?.data()
-        if (scriptJaja != null) {
-            jajaStr = Regex("""(?:const|var|let)?\s*jaja\s*=\s*["']([^"']+)["']""").find(scriptJaja)?.groupValues?.get(1)
-        }
-
-        if (jajaStr == null && cid.isNotEmpty() && !requestUrl.contains("/leer/")) {
+        val scriptText = document.select("script:containsData(OTHER_CHAPTERS)").toString()
+        val otherMatch = Regex("""let\s+OTHER_CHAPTERS\s*=\s*(\[.*?\]);""").find(scriptText)
+        if (otherMatch != null && mangaId.isNotEmpty()) {
             try {
-                val leerReq = GET("$baseUrl/manga/leer/$cid", headersBuilder().set("Referer", requestUrl).build())
-                val leerResp = client.newCall(leerReq).execute()
-                if (leerResp.isSuccessful) {
-                    val s = leerResp.asJsoup().selectFirst("script:containsData(jaja)")?.data()
-                    if (s != null) {
-                        jajaStr = Regex("""(?:const|var|let)?\s*jaja\s*=\s*["']([^"']+)["']""").find(s)?.groupValues?.get(1)
+                val array = json.parseToJsonElement(otherMatch.groupValues[1]).jsonArray
+                for (entry in array) {
+                    val numStr = entry.jsonObject["NumCap"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                    if (numStr.isEmpty()) continue
+                    val cleanPath = "/manga/$mangaId/capitulo/$numStr"
+                    if (seenUrls.add(cleanPath)) {
+                        val titleStr = entry.jsonObject["title"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                        chapters.add(
+                            SChapter.create().apply {
+                                this.name = "Capítulo $numStr" + if (titleStr.isNotEmpty()) " - $titleStr" else ""
+                                this.url = cleanPath
+                                this.chapter_number = numStr.toFloatOrNull() ?: -1f
+                            },
+                        )
                     }
                 }
-                leerResp.close()
             } catch (_: Exception) {}
         }
 
-        if (!jajaStr.isNullOrBlank()) {
-            val decryptedUrls = decryptJaja(jajaStr)
-            if (decryptedUrls.isNotEmpty()) {
-                return decryptedUrls.mapIndexed { index, url ->
-                    Page(index, "$baseUrl/", url)
-                }
-            }
-        }
-
-        // 2. Direct probe against KuManga's databank CDN (databank.kumanga.com)
-        if (cid.isNotEmpty()) {
-            val probeHeaders = headersBuilder().set("Referer", "$baseUrl/").build()
-            val pages = mutableListOf<Page>()
-            var pIdx = 1
-            var finished = false
-
-            while (!finished && pIdx <= 400) {
-                val chunkSize = 10
-                val chunkPages = (pIdx until pIdx + chunkSize).toList()
-                val futures = chunkPages.map { p ->
-                    val imgUrl = "https://databank.kumanga.com/manga/$cid/$p.jpg"
-                    val headReq = Request.Builder().url(imgUrl).head().headers(probeHeaders).build()
-                    client.dispatcher.executorService.submit<Pair<Int, Boolean>> {
-                        try {
-                            client.newCall(headReq).execute().use { r ->
-                                Pair(p, r.isSuccessful)
-                            }
-                        } catch (_: Exception) {
-                            Pair(p, false)
-                        }
-                    }
-                }
-
-                val results = futures.map { it.get() }.toMap()
-                for (p in chunkPages) {
-                    if (results[p] == true) {
-                        pages.add(Page(p - 1, "$baseUrl/", "https://databank.kumanga.com/manga/$cid/$p.jpg"))
-                    } else {
-                        finished = true
-                        break
-                    }
-                }
-                pIdx += chunkSize
-            }
-
-            if (pages.isNotEmpty()) {
-                return pages
-            }
-        }
-
-        throw Exception("No fue posible obtener las páginas del capítulo")
+        return chapters.sortedByDescending { it.chapter_number }
     }
 
-    private fun decryptJaja(jajaVal: String): List<String> = try {
+    override fun getChapterUrl(chapter: SChapter): String = "$baseUrl${chapter.url}"
+
+    // =============================== Pages ================================
+
+    override fun pageListRequest(chapter: SChapter): Request {
+        val cleanUrl = if (chapter.url.startsWith("/")) chapter.url else "/${chapter.url}"
+        return GET("$baseUrl$cleanUrl", headersBuilder().set("Referer", "$baseUrl/").build())
+    }
+
+    override fun pageListParse(response: Response): List<Page> {
+        val doc = response.asJsoup()
+        val reqUrl = response.request.url.toString()
+
+        // 1. Identify chapter ID to reach the actual reader page (/manga/leer/$chapterId)
+        var chapterId = Regex("""/(?:leer|c)/(\d+)""").find(reqUrl)?.groupValues?.get(1).orEmpty()
+        if (chapterId.isEmpty()) {
+            val link = doc.selectFirst("a.readButton, a#leer, a[href*='/leer/'], a[href*='/c/']")?.attr("href").orEmpty()
+            chapterId = Regex("""/(?:leer|c)/(\d+)""").find(link)?.groupValues?.get(1).orEmpty()
+        }
+        if (chapterId.isEmpty()) {
+            chapterId = Regex("""manga/(?:leer|c)/(\d+)""").find(doc.html())?.groupValues?.get(1).orEmpty()
+        }
+
+        var readerDoc = doc
+        var htmlContent = doc.html()
+
+        // 2. If not already on the reader page, navigate to /manga/leer/$chapterId
+        if (chapterId.isNotEmpty() && !reqUrl.contains("/leer/")) {
+            val readerReq = GET("$baseUrl/manga/leer/$chapterId", headersBuilder().set("Referer", reqUrl).build())
+            val readerRes = client.newCall(readerReq).execute()
+            if (!readerRes.isSuccessful) {
+                if (readerRes.code == 403 || readerRes.code == 503) {
+                    throw Exception("Protegido por Cloudflare (HTTP ${readerRes.code}). Abre el WebView para resolver la verificación.")
+                }
+                throw Exception("Error HTTP ${readerRes.code} al obtener páginas")
+            }
+            val bodyText = readerRes.body.string()
+            if (isCloudflareChallenge(bodyText)) {
+                throw Exception("Protegido por Cloudflare. Abre el WebView para resolver la verificación.")
+            }
+            htmlContent = bodyText
+            readerDoc = Jsoup.parse(bodyText, "$baseUrl/manga/leer/$chapterId")
+        }
+
+        // --- Method A: Hex encoded images (img.php?src=<hex>) ---
+        val hexImages = readerDoc.select("img[data-src*='img.php?src='], img[src*='img.php?src=']")
+        if (hexImages.isNotEmpty()) {
+            val pages = hexImages.mapIndexedNotNull { index, el ->
+                val src = el.attr("data-src").ifEmpty { el.attr("src") }
+                val hex = src.substringAfter("img.php?src=").substringBefore("&")
+                val decoded = decodeHex(hex)
+                if (decoded.isNotBlank()) {
+                    val fullUrl = if (decoded.startsWith("http")) decoded else "$baseUrl/${decoded.removePrefix("/")}"
+                    Page(index, "$baseUrl/", fullUrl)
+                } else null
+            }
+            if (pages.isNotEmpty()) return pages
+        }
+
+        // --- Method B: pUrl (double-base64 reversed with 10-char drop) ---
+        val rawPUrl = readerDoc.selectFirst("script:containsData(pUrl=)")?.data()
+            ?.substringAfter("pUrl=")
+            ?.substringBefore(";")
+            ?.trim()
+            ?.removeSurrounding("'", "\"")
+
+        if (!rawPUrl.isNullOrBlank()) {
+            val decoded = decodePUrl(rawPUrl)
+            if (decoded.isNotEmpty()) {
+                return decoded.mapIndexed { index, imgUrl ->
+                    val fullUrl = if (imgUrl.startsWith("http")) imgUrl else "$baseUrl/${imgUrl.removePrefix("/").replace("\\", "")}"
+                    Page(index, "$baseUrl/", fullUrl)
+                }
+            }
+        }
+
+        // --- Method C: rpics / jaja XOR decryption with "Jr54VwepF4La" ---
+        val rpicsMatch = Regex("""const\s+rpics\s*=\s*([a-zA-Z0-9_]+);""").find(htmlContent)
+        val rpicsVarName = rpicsMatch?.groupValues?.get(1)
+        val rpicsB64 = if (rpicsVarName != null) {
+            Regex("""const\s+$rpicsVarName\s*=\s*["']([^"']+)["']""").find(htmlContent)?.groupValues?.get(1)
+        } else null
+        val jajaB64 = Regex("""(?:const|var|let)?\s*jaja\s*=\s*["']([^"']+)["']""").find(htmlContent)?.groupValues?.get(1)
+
+        val xorB64 = rpicsB64 ?: jajaB64
+        if (!xorB64.isNullOrBlank()) {
+            val decodedUrls = decodeXor(xorB64)
+            if (decodedUrls.isNotEmpty()) {
+                return decodedUrls.mapIndexed { index, imgUrl ->
+                    val realUrl = if ("src=" in imgUrl) {
+                        val hexStr = imgUrl.substringAfter("src=").substringBefore("&")
+                        decodeHex(hexStr).ifEmpty { imgUrl }
+                    } else imgUrl
+                    val fullUrl = if (realUrl.startsWith("http")) realUrl else "$baseUrl/${realUrl.removePrefix("/").replace("\\", "")}"
+                    Page(index, "$baseUrl/", fullUrl)
+                }
+            }
+        }
+
+        // --- Method D: pageFormat ("12345" key decryption) ---
+        val pageFormatMatch = Regex("""pageFormat\s*[:=]\s*["']([^"']+)["']""").find(htmlContent)
+        val pagesCountMatch = Regex("""(?:pages|totCntnts|total)\s*[:=]\s*(\d+)""").find(htmlContent)
+        if (pageFormatMatch != null) {
+            val pageFormatB64 = pageFormatMatch.groupValues[1]
+            val template = decryptPageFormat(pageFormatB64, "12345")
+            val totalPages = pagesCountMatch?.groupValues?.get(1)?.toIntOrNull() ?: 100
+            if (template.contains("{pnumber}") || template.contains("/manga/")) {
+                val pages = mutableListOf<Page>()
+                for (p in 1..totalPages) {
+                    val url = template.replace("{pnumber}", p.toString())
+                    val fullUrl = if (url.startsWith("http")) url else "$baseUrl/${url.removePrefix("/")}"
+                    pages.add(Page(p - 1, "$baseUrl/", fullUrl))
+                }
+                if (pages.isNotEmpty()) return pages
+            }
+        }
+
+        // --- Method E: Fallback to direct images in reader DOM ---
+        val directImages = readerDoc.select("img").mapNotNull {
+            val src = it.attr("data-src").ifEmpty { it.attr("src") }
+            val clean = src.substringBefore("?")
+            if (clean.contains("/manga/") &&
+                !clean.contains("static.kumanga.com") &&
+                !clean.contains("logo.png") &&
+                clean.substringAfterLast(".").lowercase() in listOf("jpg", "jpeg", "png", "webp")
+            ) {
+                if (src.startsWith("http")) src else "$baseUrl/${src.removePrefix("/")}"
+            } else null
+        }.distinct()
+
+        if (directImages.isNotEmpty()) {
+            return directImages.mapIndexed { index, url -> Page(index, "$baseUrl/", url) }
+        }
+
+        if (isCloudflareChallenge(htmlContent)) {
+            throw Exception("Protegido por Cloudflare. Abre el WebView para resolver la verificación.")
+        }
+
+        throw Exception("No fue posible obtener las páginas del capítulo. Abre el WebView para verificar.")
+    }
+
+    private fun isCloudflareChallenge(html: String): Boolean {
+        return html.contains("Just a moment", ignoreCase = true) ||
+            html.contains("Un momento", ignoreCase = true) ||
+            html.contains("cf-turnstile") ||
+            html.contains("challenges.cloudflare.com") ||
+            html.contains("Verificación de seguridad")
+    }
+
+    private fun decodeHex(hex: String): String = try {
+        hex.chunked(2)
+            .map { it.toInt(16).toChar() }
+            .joinToString("")
+    } catch (_: Exception) {
+        ""
+    }
+
+    private fun decodePUrl(rawPUrl: String): List<String> = try {
+        val firstDecode = Base64.decode(rawPUrl, Base64.DEFAULT).toString(Charsets.UTF_8)
+        val reversed = firstDecode.reversed()
+        val stripped = reversed.substring(10, reversed.length - 10)
+        val secondDecode = Base64.decode(stripped, Base64.DEFAULT).toString(Charsets.UTF_8)
+        val imageList = json.decodeFromString<List<ImageDto>>(secondDecode)
+        imageList.map { it.imgURL }
+    } catch (_: Exception) {
+        emptyList()
+    }
+
+    private fun decodeXor(b64Str: String): List<String> = try {
         val key = "Jr54VwepF4La"
-        val rawBytes = Base64.decode(jajaVal, Base64.DEFAULT)
+        val rawBytes = Base64.decode(b64Str, Base64.DEFAULT)
         val decryptedChars = CharArray(rawBytes.size) { i ->
             val byteVal = rawBytes[i].toInt() and 0xFF
             val keyChar = key[i % key.length].code
             (byteVal xor keyChar).toChar()
         }
         val jsonString = String(decryptedChars)
-        val items = json.decodeFromString<List<String>>(jsonString)
-        items.map { item ->
-            if ("src=" in item) {
-                val hexStr = item.substringAfter("src=").substringBefore("&")
-                try {
-                    val bytes = hexStr.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
-                    String(bytes, Charsets.UTF_8)
-                } catch (_: Exception) {
-                    if (item.startsWith("/")) "$baseUrl$item" else item
-                }
-            } else {
-                if (item.startsWith("/")) "$baseUrl$item" else item
-            }
-        }
+        json.decodeFromString<List<String>>(jsonString)
     } catch (_: Exception) {
         emptyList()
+    }
+
+    private fun decryptPageFormat(pageFormatB64: String, key: String): String = try {
+        val decodedStr = Base64.decode(pageFormatB64, Base64.DEFAULT).toString(Charsets.ISO_8859_1)
+        val sb = StringBuilder(decodedStr.length)
+        for (i in decodedStr.indices) {
+            val charCode1 = decodedStr[i].code
+            val keyIdx = (i - 1 + key.length) % key.length
+            val charCode2 = key[keyIdx].code
+            val diff = charCode1 - charCode2
+            sb.append(diff.toChar())
+        }
+        sb.toString()
+    } catch (_: Exception) {
+        ""
     }
 
     override fun imageRequest(page: Page): Request {
@@ -374,10 +507,6 @@ class Kumanga :
         Filter.Separator(),
         GenreList(getGenreList()),
     )
-
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        screen.addRandomUAPreference()
-    }
 
     private class Type(name: String, val id: String) : Filter.CheckBox(name)
     private class TypeList(types: List<Type>) : Filter.Group<Type>("Filtrar por tipos", types)
